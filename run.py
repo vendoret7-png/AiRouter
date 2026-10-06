@@ -10,6 +10,7 @@ it for --router-port wait check.
 """
 
 import argparse
+import http.cookiejar
 import json
 import os
 import shlex
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -217,7 +219,7 @@ def note_ip(ip):
 # Idempotent: re-running creates nothing twice — node reused by baseUrl,
 # connection reused by node id. From 127.0.0.1 the custom-server stamps the
 # peer-token header itself, so /api/* calls bypass login.
-def import_freebuff(port):
+def import_freebuff(port, router_base=None):
     if os.environ.get("FREEBUFF_ENABLED", "1") not in ("1", "true", "yes"):
         print("[freebuff] disabled (FREEBUFF_ENABLED!=1)")
         return
@@ -225,17 +227,33 @@ def import_freebuff(port):
     key = os.environ.get("FREEBUFF_API_KEY", "").strip()
     name = os.environ.get("FREEBUFF_NAME", "Freebuff").strip()
     prefix = os.environ.get("FREEBUFF_PREFIX", "freebuff").strip()
-    url = f"http://127.0.0.1:{port}"
+    # router_base override lets us run the same importer against live Render
+    # (https) or any host: python -c "import run; run.import_freebuff(0, 'https://host')"
+    url = (router_base or os.environ.get("ROUTER_BASE") or f"http://127.0.0.1:{port}").rstrip("/")
+
+    # Session cookie keeps us authenticated across calls. We log in with the
+    # native password (INITIAL_PASSWORD, i.e. "sakib") so every /api/* call is
+    # an ordinary authenticated request — no reliance on the peer-token header.
+    password = (os.environ.get("INITIAL_PASSWORD") or "sakib").strip()
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
     def req(path, method="GET", payload=None):
         data = json.dumps(payload).encode() if payload is not None else None
         r = urllib.request.Request(url + path, data=data, method=method,
                                    headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(r, timeout=20) as resp:
+            with opener.open(r, timeout=20) as resp:
                 return resp.status, json.loads(resp.read().decode("utf-8", "replace") or "{}")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")
+            return e.code, {"error": body[:200]}
         except Exception as e:
             return None, {"error": str(e)}
+
+    # 0) authenticate (idempotent; also yields the cookie for later calls)
+    st, out = req("/api/auth/login", "POST", {"password": password})
+    print(f"[freebuff] login: {st} {(out or {}).get('error', '')}")
 
     # 1) provider node (openai-compatible). Reuse by baseUrl.
     node_id = None
@@ -276,9 +294,14 @@ def import_freebuff(port):
         print(f"[freebuff] connection reused: {existing.get('id')}")
 
     # 3) pull upstream models so they show up (GET import-fetches from baseUrl).
-    st, out = req(f"/api/providers/{node_id}/models")
-    models = out if isinstance(out, list) else out.get("models") or out.get("data") or []
-    print(f"[freebuff] models from upstream: {st} count={len(models) if isinstance(models, list) else 'n/a'}")
+    # Only meaningful once a connection exists — the route 404s without one.
+    if existing:
+        st, out = req(f"/api/providers/{node_id}/models")
+        models = out if isinstance(out, list) else out.get("models") or out.get("data") or []
+        n = len(models) if isinstance(models, list) else "n/a"
+        print(f"[freebuff] models from upstream: {st} count={n} err={(out or {}).get('error', '')}")
+    else:
+        print("[freebuff] skip model sync: no connection yet")
 
 
 def update_watcher(state):
