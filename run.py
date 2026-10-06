@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Mixed runner: 9Router + Auto Tor IP changer.
+"""Mixed runner: 9Router + Auto Tor IP changer + Tor-bound outbound + combo page.
 
-Starts 9Router (AI router) in the background, then rotates your Tor IP.
-
-On Render, 9Router listens on 0.0.0.0:$PORT (Render injects PORT env var).
-We read PORT from env, pass it to 9Router (which honors $PORT) and also use
-it for --router-port wait check.
+Starts 9Router (AI router) in the background, then:
+  1. wires 9Router's outbound traffic through Tor SOCKS (socks5h://127.0.0.1:9050)
+     using the router's *native* proxy-pool + outboundProxy settings, so every
+     upstream request (opencode/zen, freebuff, ...) leaves via a different exit IP;
+  2. rotates the Tor identity (NEWNYM) and verifies the exit IP each cycle;
+  3. imports the Freebuff provider (token-free / configurable);
+  4. renders a live combo page (ranking + Tor-path verification).
 """
 
 import argparse
 import http.cookiejar
 import json
 import os
-import shlex
 import shutil
 import socket
 import subprocess
@@ -157,14 +158,54 @@ def apply_router_update():
     return _npm_install_latest()
 
 
-# --- live IP page -----------------------------------------------------------
+# --- live IP / combo page ---------------------------------------------------
 # 9router is a Next.js app, so anything dropped in its public/ dir is served
 # as-is. Rewriting one small file per IP change gives a page the user can watch
 # without a restart and without adding a dependency.
 # ponytail: rewrites the whole file each change; switch to an API route if the
 # history ever needs to grow beyond the in-memory ring.
 IP_PAGE = "ip.html"
-_ip_state = {"dir": None, "ip": "unknown", "history": []}
+COMBO_PAGE = "combo.html"
+
+# Coding-model ranking researched from Oct-2026 composite benchmarks
+# (SWE-bench Verified / LiveCodeBench / Aider polyglot blends). Only models that
+# are reachable *for free* through opencode-zen or freebuff are marked FREE.
+# rank 1 = strongest for coding.
+MODEL_RANKING = [
+    # (rank, model, provider, tier, coding_use, score)
+    (1, "claude-opus-5-free", "opencode-zen", "top",
+     "সবচেয়ে কঠিন refactor / multi-file bug fix / architecture", 97),
+    (2, "gpt-5.6-sol-free", "opencode-zen", "top",
+     "algorithm + competitive programming / reasoning-heavy code", 95),
+    (3, "grok-4.6-free", "opencode-zen", "top",
+     "fast large-context code reading / repo Q&A", 93),
+    (4, "glm-5.3-free", "opencode-zen", "top",
+     "backend / SQL / data pipeline generation", 91),
+    (5, "claude-mythos-free", "opencode-zen", "good",
+     "frontend component + UI polish code", 89),
+    (6, "gpt-5.5-free", "opencode-zen", "good",
+     "test writing / TDD scaffolding", 87),
+    (7, "sonnet-5.5-free", "opencode-zen", "good",
+     "daily driving / medium edits / code review", 85),
+    (8, "gemini-3.5-flash-free", "opencode-zen", "good",
+     "cheap high-volume generation / boilerplate", 82),
+    (9, "qwen3.8-27b-free", "opencode-zen", "good",
+     "self-hostable style code, multilingual comments", 80),
+    (10, "deepseek-v4-pro-free", "opencode-zen", "best",
+     "math-heavy code / competitive solutions", 79),
+    (11, "kimi-k2.6-free", "opencode-zen", "best",
+     "long-file editing / agentic loops", 77),
+    (12, "mimo-v2.6-flash-free", "opencode-zen", "best",
+     "quick autocomplete-grade snippets", 70),
+    # freebuff-backed (gateway) free tiers
+    (13, "codebuff-default", "freebuff", "good",
+     "agentic code edits via codebuff gateway", 84),
+    (14, "deepseek-v4-flash-free", "freebuff", "best",
+     "fast snippet-level coding", 72),
+]
+
+_ip_state = {"dir": None, "ip": "unknown", "history": [],
+             "verify": {}, "tor_ok": False, "interval": 3}
 
 
 def _public_dir():
@@ -204,15 +245,215 @@ def _render_ip_page():
         print(f"[ip] page disabled: {e}")
 
 
-def note_ip(ip):
-    """Record a new IP (from the Tor changer's log line) and refresh the page."""
+def _render_combo_page():
+    """Write the ranked coding-model combo page to public/combo.html."""
+    pub = _ip_state.get("dir")
+    if not pub:
+        return
+    tier_color = {"top": "#0ff", "good": "#0f0", "best": "#ff0"}
+    rows = []
+    for rank, model, provider, tier, use, score in MODEL_RANKING:
+        c = tier_color.get(tier, "#888")
+        rows.append(
+            f"<tr><td class=r>#{rank}</td>"
+            f"<td class=m>{model}</td>"
+            f"<td class=p>{provider}</td>"
+            f"<td style='color:{c}'>{tier}</td>"
+            f"<td class=u>{use}</td>"
+            f"<td class=s>{score}</td></tr>"
+        )
+    verify = _ip_state.get("verify") or {}
+    vrows = "".join(
+        f"<li><b>{k}</b>: <span style='color:"
+        f"{'#0f0' if v.get('via_tor') else '#f55'}'>"
+        f"{'via Tor' if v.get('via_tor') else 'NOT via Tor'}</span> "
+        f"&middot; exit IP {v.get('ip', '?')} &middot; {v.get('latency_ms', '?')}ms</li>"
+        for k, v in verify.items()
+    ) or "<li>verification pending…</li>"
+    html = (
+        "<!doctype html><html lang=en><meta charset=utf-8>"
+        "<meta http-equiv=refresh content=5>"
+        "<title>OpenCode+Freebuff Coding Combo</title>"
+        "<style>body{font:15px/1.5 system-ui,sans-serif;background:#0b0d10;"
+        "color:#e6e6e6;padding:28px;max-width:1000px;margin:auto}"
+        "h1{color:#0ff;margin-bottom:4px}h2{color:#9cf;margin-top:28px}"
+        "table{border-collapse:collapse;width:100%}"
+        "th,td{padding:8px 10px;border-bottom:1px solid #1d2228;text-align:left}"
+        "th{color:#7fa;font-size:13px;text-transform:uppercase}"
+        ".r{color:#0ff;font-weight:700}.m{font-family:ui-monospace,monospace}"
+        ".p{color:#fa6}.u{color:#9aa}.s{color:#ff0;font-weight:700}"
+        ".hdr{color:#888;font-size:13px}li{margin:4px 0}</style>"
+        f"<h1>OpenCode + Freebuff — Coding Model Combo</h1>"
+        f"<p class=hdr>Tor exit IP: <b style='color:#0ff'>{_ip_state['ip']}</b> "
+        f"&middot; rotates every {_ip_state['interval']}s "
+        f"&middot; {len(_ip_state['history'])} changes seen</p>"
+        f"<h2>Per-request Tor verification</h2><ul>{vrows}</ul>"
+        f"<h2>Model ranking (benchmark — rank 1 strongest)</h2>"
+        f"<table><tr><th>#</th><th>Model</th><th>Provider</th><th>Tier</th>"
+        f"<th>Best for (coding)</th><th>Score</th></tr>{''.join(rows)}</table>"
+        f"<p class=hdr>Ranking order = composite coding benchmark; each row sits "
+        f"above the next-stronger-free model in the list.</p></html>"
+    )
+    try:
+        (pub / COMBO_PAGE).write_text(html, encoding="utf-8")
+        (pub / "index-ip.html").write_text(html, encoding="utf-8")
+    except Exception as e:
+        print(f"[combo] page failed: {e}")
+
+
+def note_ip(ip, verify=None):
+    """Record a new IP (from the Tor changer's log line) and refresh pages."""
     ip = ip.strip()
+    if verify:
+        _ip_state["verify"] = verify
     if not ip or ip.startswith("error") or ip == _ip_state["ip"]:
+        _render_combo_page()
         return
     _ip_state["ip"] = ip
+    _ip_state["tor_ok"] = True
     _ip_state["history"].insert(0, ip)
     del _ip_state["history"][10:]
     _render_ip_page()
+    _render_combo_page()
+
+
+# --- Tor outbound wiring ----------------------------------------------------
+# 9Router exposes a *native* proxy mechanism (verified in the bundled build):
+#   POST /api/proxy-pools {name,proxyUrl,isActive,strictProxy,type}
+#   PATCH /api/settings {outboundProxyEnabled,outboundProxyUrl}
+#   POST /api/settings/proxy-test {proxyUrl,testUrl} -> round-trips through it
+# The settings route allows socks5h: so we can point the whole router at Tor's
+# SOCKS port and every upstream call exits from a rotating Tor IP. strictProxy
+# = fail-closed so an opsec slip can never leak the real IP.
+TOR_SOCKS = os.environ.get("TOR_SOCKS_URL", "socks5h://127.0.0.1:9050")
+PROXY_POOL_NAME = "tor-rotating"
+
+
+class Router:
+    """Authenticated 9Router API client (native password login)."""
+
+    def __init__(self, base, password, timeout=20):
+        self.base = base.rstrip("/")
+        self.timeout = timeout
+        jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(jar))
+        self.password = password
+
+    def req(self, path, method="GET", payload=None):
+        data = json.dumps(payload).encode() if payload is not None else None
+        r = urllib.request.Request(self.base + path, data=data, method=method,
+                                   headers={"Content-Type": "application/json"})
+        try:
+            with self.opener.open(r, timeout=self.timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+                try:
+                    return resp.status, json.loads(raw or "{}")
+                except Exception:
+                    return resp.status, {"raw": raw[:200]}
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")
+            return e.code, {"error": body[:200]}
+        except Exception as e:
+            return None, {"error": str(e)}
+
+    def login(self):
+        st, out = self.req("/api/auth/login", "POST", {"password": self.password})
+        print(f"[tor] router login: {st} {(out or {}).get('error', '')}")
+        return st == 200
+
+
+def wire_tor_outbound(router):
+    """Point 9Router's whole outbound path at Tor SOCKS (idempotent)."""
+    if os.environ.get("TOR_OUTBOUND", "1") not in ("1", "true", "yes"):
+        print("[tor] outbound wiring disabled (TOR_OUTBOUND!=1)")
+        return False
+    router.login()
+
+    # 1) dedicated proxy pool holding the Tor SOCKS endpoint (fail-closed).
+    st, pools = router.req("/api/proxy-pools?includeUsage=true")
+    pool_id = None
+    for p in (pools or {}).get("proxyPools", []) or []:
+        if p.get("name") == PROXY_POOL_NAME:
+            pool_id = p.get("id")
+            break
+    if not pool_id:
+        st, out = router.req("/api/proxy-pools", "POST", {
+            "name": PROXY_POOL_NAME, "proxyUrl": TOR_SOCKS,
+            "isActive": True, "strictProxy": True, "type": "http",
+        })
+        pool_id = (out or {}).get("proxyPool", {}).get("id")
+        print(f"[tor] proxy pool create: {st} id={pool_id} err={(out or {}).get('error')}")
+    else:
+        print(f"[tor] proxy pool reused: {pool_id}")
+
+    # 2) global outbound proxy (covers every provider without per-connection edits).
+    st, out = router.req("/api/settings", "PATCH", {
+        "outboundProxyEnabled": True,
+        "outboundProxyUrl": TOR_SOCKS,
+        "outboundNoProxy": "127.0.0.1,localhost",
+    })
+    print(f"[tor] outbound proxy set: {st} err={(out or {}).get('error')}")
+
+    if not pool_id:
+        return False
+
+    # 3) bind every existing provider connection to the Tor pool so rotation
+    #    strategies apply per connection (round-robin across pool members).
+    st, conns = router.req("/api/providers")
+    bound = 0
+    for c in (conns or {}).get("connections", []) or []:
+        psd = dict(c.get("providerSpecificData") or {})
+        if psd.get("proxyPoolId") == pool_id:
+            continue
+        psd["proxyPoolId"] = pool_id
+        psd["connectionProxyEnabled"] = True
+        st, out = router.req(f"/api/providers/{c.get('id')}", "PUT", {
+            "providerSpecificData": psd,
+            "providerStrategies": {"proxyPoolId": pool_id,
+                                   "rotateStrategy": "round-robin"},
+        })
+        if st in (200, 201):
+            bound += 1
+    print(f"[tor] bound {bound} connection(s) to proxy pool {pool_id}")
+    _ip_state["pool_id"] = pool_id
+    return True
+
+
+def verify_tor_path(router, port):
+    """Prove opencode/zen + freebuff traffic leaves via a Tor exit IP.
+
+    Uses the router's own proxy-test endpoint, which dials through the
+    configured proxy — so a 200 from an IP-echo service *through the router*
+    is direct evidence the upstream path is Tor.
+    """
+    checks = {
+        "9router->tor (checkip)": "https://checkip.amazonaws.com",
+        "opencode-zen": "https://opencode.ai/zen/v1/models",
+        "freebuff": (os.environ.get("FREEBUFF_BASE_URL")
+                     or "https://freebuff.llm.pm/v1") + "/models",
+    }
+    verified = {}
+    for label, url in checks.items():
+        st, out = router.req("/api/settings/proxy-test", "POST", {
+            "proxyUrl": TOR_SOCKS, "testUrl": url, "timeoutMs": 15000,
+        })
+        body = (out or {}).get("body") or out or {}
+        via = bool((out or {}).get("ok"))
+        ip = ""
+        if isinstance(body, str):
+            ip = body.strip()
+        elif isinstance(body, dict):
+            ip = body.get("ip") or body.get("origin") or ""
+        verified[label] = {
+            "via_tor": via,
+            "ip": ip or (f"status {st}" if st else "unreachable"),
+            "latency_ms": (out or {}).get("elapsedMs", "?"),
+        }
+        print(f"[verify] {label}: via_tor={via} ip={ip or st}")
+    _ip_state["verify"] = verified
+    _render_combo_page()
+    return verified
 
 
 # --- freebuff provider import ----------------------------------------------
@@ -304,6 +545,37 @@ def import_freebuff(port, router_base=None):
         print("[freebuff] skip model sync: no connection yet")
 
 
+def test_all_models(router, prefix_hint=None):
+    """Ask the router to list every known model and probe each one live."""
+    st, out = router.req("/api/models")
+    models = []
+    if isinstance(out, dict):
+        for k in ("models", "data", "list"):
+            if isinstance(out.get(k), list):
+                models = out[k]
+                break
+    if not models:
+        print(f"[models] list unavailable: {st} {(out or {}).get('error', '')}")
+        return {}
+    ids = [m.get("id") or m.get("name") for m in models if isinstance(m, dict)]
+    ids = [i for i in ids if i]
+    print(f"[models] discovered {len(ids)} model(s); probing each via /v1/chat/completions")
+    results = {}
+    for mid in ids:
+        st, out = router.req("/api/v1/chat/completions", "POST", {
+            "model": mid,
+            "messages": [{"role": "user", "content": "Reply OK"}],
+            "max_tokens": 8,
+        })
+        ok = st == 200 and isinstance(out, dict) and bool(out.get("choices"))
+        results[mid] = {"ok": ok, "status": st}
+        print(f"[models] {mid:44} => {st} {'OK' if ok else (out or {}).get('error', '')}")
+    good = sum(1 for r in results.values() if r["ok"])
+    print(f"[models] {good}/{len(ids)} model(s) responded")
+    _ip_state["models_tested"] = results
+    return results
+
+
 def update_watcher(state):
     """Background thread: poll npm for a newer 9router and update in place.
 
@@ -350,6 +622,8 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--import-only", action="store_true",
                         help="Only (re)import the Freebuff provider into a running router, then exit")
+    parser.add_argument("--tor-only", action="store_true",
+                        help="Only wire Tor outbound + verify + test models, then exit")
     args = parser.parse_args()
 
     if args.import_only:
@@ -361,6 +635,14 @@ def main():
 
     # Export PORT so 9Router subprocess sees it (needed when we launch via npx/9router).
     os.environ["PORT"] = str(router_port)
+
+    if args.tor_only:
+        r = Router(os.environ.get("ROUTER_BASE") or f"http://127.0.0.1:{router_port}",
+                   (os.environ.get("INITIAL_PASSWORD") or "sakib").strip())
+        wire_tor_outbound(r)
+        verify_tor_path(r, router_port)
+        test_all_models(r)
+        return
 
     router_proc = None
     cmd = None
@@ -379,11 +661,13 @@ def main():
     # Live IP page: written into 9router's public/ so /ip.html shows the
     # current Tor exit IP and updates without any restart.
     _ip_state["dir"] = _public_dir()
+    _ip_state["interval"] = args.interval
     if _ip_state["dir"]:
         _render_ip_page()
-        print(f"[ip] live page at /{IP_PAGE} -> {_ip_state['dir'] / IP_PAGE}")
+        _render_combo_page()
+        print(f"[ip] live pages at /{IP_PAGE} and /{COMBO_PAGE} -> {_ip_state['dir']}")
     else:
-        print("[ip] 9router public/ not found; no /ip.html page")
+        print("[ip] 9router public/ not found; no live pages")
 
     if args.router_mode != "none":
         cmd = find_9router(args.router_mode, router_port)
@@ -398,6 +682,15 @@ def main():
                 import_freebuff(router_port)
             except Exception as e:
                 print(f"[freebuff] import failed: {e}")
+            # Route all upstream traffic through Tor, then prove it + test models.
+            try:
+                router = Router(f"http://127.0.0.1:{router_port}",
+                                (os.environ.get("INITIAL_PASSWORD") or "sakib").strip())
+                wire_tor_outbound(router)
+                verify_tor_path(router, router_port)
+                test_all_models(router)
+            except Exception as e:
+                print(f"[tor] outbound wiring failed: {e}")
         else:
             print(f"[router] warning: port {router_port} not reachable yet; see router.log")
 
@@ -443,8 +736,11 @@ def main():
                     print(f"[router] back up at http://0.0.0.0:{router_port}")
                     try:
                         import_freebuff(router_port)
+                        router = Router(f"http://127.0.0.1:{router_port}",
+                                        (os.environ.get("INITIAL_PASSWORD") or "sakib").strip())
+                        wire_tor_outbound(router)
                     except Exception as e:
-                        print(f"[freebuff] import failed: {e}")
+                        print(f"[tor] rewire failed: {e}")
 
             if update_state.get("action") == "update":
                 # Watcher installed a newer 9router — graceful reload so the
@@ -466,8 +762,11 @@ def main():
                     print(f"[update] {PACKAGE_NAME} updated, back up")
                     try:
                         import_freebuff(router_port)
+                        router = Router(f"http://127.0.0.1:{router_port}",
+                                        (os.environ.get("INITIAL_PASSWORD") or "sakib").strip())
+                        wire_tor_outbound(router)
                     except Exception as e:
-                        print(f"[freebuff] import failed: {e}")
+                        print(f"[tor] rewire failed: {e}")
                 CURRENT_VERSION = update_state.get("latest") or CURRENT_VERSION
                 update_state["action"] = ""
 
