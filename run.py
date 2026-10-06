@@ -30,12 +30,16 @@ def find_9router(mode, port):
         router = shutil.which("9router")
         # Docker overrides $HOSTNAME with the container ID, so never rely on
         # env for binding — pass --host/--port explicitly.
+        # NOTE: do NOT pass --skip-update — we WANT 9Router's built-in
+        # auto-update so new versions apply without a manual restart.
         flags = ["--host", "0.0.0.0", "--port", str(port),
-                 "--no-browser", "--skip-update"]
+                 "--no-browser"]
         if router:
             return [router] + flags
         if npx:
-            return [npx, "9router@latest"] + flags
+            # Use a stable package name (no @latest pin) so the locally
+            # installed 9router can self-update in place.
+            return [npx, "--yes", "9router"] + flags
         return None
     return None
 
