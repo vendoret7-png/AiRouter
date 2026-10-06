@@ -98,6 +98,7 @@ def main():
     os.environ["PORT"] = str(router_port)
 
     router_proc = None
+    cmd = None
     if args.router_mode != "none":
         cmd = find_9router(args.router_mode, router_port)
         if not cmd:
@@ -137,8 +138,18 @@ def main():
     try:
         while True:
             if router_proc and router_proc.poll() is not None:
-                print("[router] exited unexpectedly.")
-                break
+                # 9Router exits by itself after applying an auto-update (it prints
+                # "Exiting..."). That is NOT a crash -- respawn it so the new
+                # version is picked up without restarting the whole service.
+                code = router_proc.returncode
+                print(f"[router] exited (code={code}); restarting in 2s "
+                      f"(expected after a 9router auto-update).")
+                time.sleep(2)
+                router_proc = start_router(cmd)
+                if not wait_for_port(router_port, timeout=45):
+                    print(f"[router] warning: port {router_port} not back yet")
+                else:
+                    print(f"[router] back up at http://0.0.0.0:{router_port}")
             if tor_proc.poll() is not None:
                 print("[tor] auto IP changer exited.")
                 break
