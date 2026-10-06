@@ -155,6 +155,64 @@ def apply_router_update():
     return _npm_install_latest()
 
 
+# --- live IP page -----------------------------------------------------------
+# 9router is a Next.js app, so anything dropped in its public/ dir is served
+# as-is. Rewriting one small file per IP change gives a page the user can watch
+# without a restart and without adding a dependency.
+# ponytail: rewrites the whole file each change; switch to an API route if the
+# history ever needs to grow beyond the in-memory ring.
+IP_PAGE = "ip.html"
+_ip_state = {"dir": None, "ip": "unknown", "history": []}
+
+
+def _public_dir():
+    """Return the installed 9router public/ dir, or None if not found."""
+    npm = shutil.which("npm")
+    if not npm:
+        return None
+    try:
+        r = subprocess.run([npm, "root", "-g"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True, timeout=30)
+        pub = Path(r.stdout.strip()) / PACKAGE_NAME / "app" / "public"
+        return pub if pub.is_dir() else None
+    except Exception:
+        return None
+
+
+def _render_ip_page():
+    """Write the current IP + recent history to public/ip.html."""
+    pub = _ip_state.get("dir")
+    if not pub:
+        return
+    items = "".join(f"<li>{h}</li>" for h in _ip_state["history"]) or "<li>-</li>"
+    html = (
+        "<!doctype html><html lang=en><meta charset=utf-8>"
+        "<meta http-equiv=refresh content=3>"
+        "<title>Tor IP</title>"
+        "<style>body{font:16px ui-monospace,monospace;background:#111;color:#0f0;"
+        "padding:24px}#ip{font-size:42px;color:#0ff}li{color:#888}</style>"
+        f"<h1>Current Tor exit IP</h1><div id=ip>{_ip_state['ip']}</div>"
+        f"<p>refreshes every 3s &middot; {len(_ip_state['history'])} changes seen</p>"
+        f"<ol>{items}</ol></html>"
+    )
+    try:
+        (pub / IP_PAGE).write_text(html, encoding="utf-8")
+    except Exception as e:
+        _ip_state["dir"] = None  # stop retrying every 3s
+        print(f"[ip] page disabled: {e}")
+
+
+def note_ip(ip):
+    """Record a new IP (from the Tor changer's log line) and refresh the page."""
+    ip = ip.strip()
+    if not ip or ip.startswith("error") or ip == _ip_state["ip"]:
+        return
+    _ip_state["ip"] = ip
+    _ip_state["history"].insert(0, ip)
+    del _ip_state["history"][10:]
+    _render_ip_page()
+
+
 def update_watcher(state):
     """Background thread: poll npm for a newer 9router and update in place.
 
@@ -219,6 +277,15 @@ def main():
     ).start()
     print(f"[update] watcher started (every {UPDATE_CHECK_INTERVAL}s), "
           f"installed {PACKAGE_NAME}@{CURRENT_VERSION}")
+
+    # Live IP page: written into 9router's public/ so /ip.html shows the
+    # current Tor exit IP and updates without any restart.
+    _ip_state["dir"] = _public_dir()
+    if _ip_state["dir"]:
+        _render_ip_page()
+        print(f"[ip] live page at /{IP_PAGE} -> {_ip_state['dir'] / IP_PAGE}")
+    else:
+        print("[ip] 9router public/ not found; no /ip.html page")
 
     if args.router_mode != "none":
         cmd = find_9router(args.router_mode, router_port)
@@ -299,7 +366,12 @@ def main():
                 break
             line = tor_proc.stdout.readline()
             if line:
-                print(line.rstrip())
+                line = line.rstrip()
+                print(line)
+                # auto_tor prints "[auto_tor] #N IP changed: 1.2.3.4" — feed
+                # the address to the live page.
+                if "IP changed:" in line:
+                    note_ip(line.rsplit("IP changed:", 1)[1])
             else:
                 time.sleep(0.1)
     except KeyboardInterrupt:
