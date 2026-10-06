@@ -58,7 +58,7 @@ python run.py -h
 ## Disclaimer
 
 Use responsibly. Rapid IP rotation may violate the terms of service of some providers and can look abusive. For legal/ethical use only.
-# Test marker 20261006T214750Z
+# Test marker 20261006T220500Z
 
 Live Tor exit IP page: /ip.html (auto-refreshes every 3s, shown after redeploy).
-Persist check marker: IPPAGE-0107
+Persist check marker: IPPAGE-0108
