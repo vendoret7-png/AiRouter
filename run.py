@@ -348,7 +348,14 @@ def main():
     parser.add_argument("--control-password", default=None)
     parser.add_argument("--socks-port", type=int, default=9050)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--import-only", action="store_true",
+                        help="Only (re)import the Freebuff provider into a running router, then exit")
     args = parser.parse_args()
+
+    if args.import_only:
+        rp = int(env_port) if env_port else 20128
+        import_freebuff(rp, router_base=os.environ.get("ROUTER_BASE"))
+        return
 
     router_port = getattr(args, "router_port", int(env_port) if env_port else 20128)
 
