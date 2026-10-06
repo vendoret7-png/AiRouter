@@ -1,0 +1,17 @@
+# Render Blueprint: AiRouter (9Router + Auto Tor IP changer)
+# autoDeploy: true means pushing to main triggers a new deploy automatically.
+# No manual restart needed when code/webpage changes.
+services:
+  - type: web
+    name: ai-router
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /
+    envVars:
+      - key: HOSTNAME
+        value: 0.0.0.0
+      - key: PORT
+        value: 10000

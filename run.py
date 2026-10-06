@@ -3,32 +3,41 @@
 """Mixed runner: 9Router + Auto Tor IP changer.
 
 Starts 9Router (AI router) in the background, then rotates your Tor IP.
+
+On Render, 9Router listens on 0.0.0.0:$PORT (Render injects PORT env var).
+We read PORT from env, pass it to 9Router (which honors $PORT) and also use
+it for --router-port wait check.
 """
 
 import argparse
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 
-def find_9router(mode):
-    """Return command to launch 9Router."""
+def find_9router(mode, port):
+    """Return command to launch 9Router on given port."""
     if mode == "docker":
-        return ["docker", "run", "--rm", "-p", "20128:20128", "decolua/9router:latest"]
+        return ["docker", "run", "--rm", "-e", f"PORT={port}",
+                "-p", f"{port}:{port}", "decolua/9router:latest"]
     if mode == "npm":
         npx = shutil.which("npx") or shutil.which("npm")
+        router = shutil.which("9router")
+        if router:
+            return [router]  # 9router reads PORT env var
         if npx:
-            return [npx, "9router@latest"]
+            return [npx, "9router@latest"]  # also reads PORT env
         return None
     return None
 
 
 def start_router(cmd, log_path):
-    """Start router in background, returning Popen."""
+    """Start router in background. PORT env is inherited from this process."""
     print(f"[router] starting: {' '.join(cmd)}")
     with open(log_path, "w", encoding="utf-8") as f:
         proc = subprocess.Popen(
@@ -41,7 +50,7 @@ def start_router(cmd, log_path):
     return proc
 
 
-def wait_for_port(port, timeout=15):
+def wait_for_port(port, timeout=30):
     """Wait until local port is accepting connections."""
     start = time.time()
     while time.time() - start < timeout:
@@ -53,16 +62,19 @@ def wait_for_port(port, timeout=15):
     return False
 
 
-import socket
-
-
 def main():
+    # Render injects PORT env; fall back to arg default.
+    env_port = os.environ.get("PORT")
+
     parser = argparse.ArgumentParser(description="AI Router = 9Router + Auto Tor IP changer")
     parser.add_argument("--interval", type=int, default=3, help="Seconds between Tor IP changes")
+    if env_port:
+        parser.set_defaults(router_port=int(env_port))
+    else:
+        parser.add_argument("--router-port", type=int, default=20128, help="9Router port")
     parser.add_argument("--router-mode", choices=["npm", "docker", "none"], default="npm",
                         help="How to start 9Router")
-    parser.add_argument("--router-port", type=int, default=20128, help="9Router port")
-    parser.add_argument("--tor-method", choices=["command", "control"], default="command",
+    parser.add_argument("--tor-method", choices=["command", "control"], default="control",
                         help="Tor reload method")
     parser.add_argument("--tor-reload", default="service tor reload",
                         help="Command to reload Tor identity (method=command)")
@@ -73,24 +85,28 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
+    router_port = getattr(args, "router_port", int(env_port) if env_port else 20128)
+
+    # Export PORT so 9Router subprocess sees it (needed when we launch via npx/9router).
+    os.environ["PORT"] = str(router_port)
+
     log_dir = Path(__file__).parent / ".ai-router-logs"
     log_dir.mkdir(exist_ok=True)
 
     router_proc = None
     if args.router_mode != "none":
-        cmd = find_9router(args.router_mode)
+        cmd = find_9router(args.router_mode, router_port)
         if not cmd:
-            print(f"[!] Cannot find npx/npm or docker for router mode {args.router_mode}.")
-            print("    Install Node.js (npm/npx) or Docker, or use --router-mode none.")
+            print(f"[!] Cannot find 9router / npx / npm for router mode {args.router_mode}.")
             sys.exit(1)
         router_proc = start_router(cmd, log_dir / "router.log")
-        print(f"[router] waiting for port {args.router_port} ...")
-        if wait_for_port(args.router_port, timeout=20):
-            print(f"[router] up at http://localhost:{args.router_port}")
+        print(f"[router] waiting for port {router_port} ...")
+        if wait_for_port(router_port, timeout=45):
+            print(f"[router] up at http://0.0.0.0:{router_port}")
         else:
-            print(f"[router] warning: port {args.router_port} not reachable yet; see router.log")
+            print(f"[router] warning: port {router_port} not reachable yet; see router.log")
 
-    # Start auto Tor IP changer in background (subprocess)
+    # Start auto Tor IP changer in background
     tor_cmd = [
         sys.executable,
         str(Path(__file__).parent / "auto_tor.py"),
@@ -106,7 +122,7 @@ def main():
     if args.verbose:
         tor_cmd.append("--verbose")
 
-    print(f"[tor] starting auto IP changer: interval={args.interval}s")
+    print(f"[tor] starting auto IP changer: interval={args.interval}s method={args.tor_method}")
     tor_proc = subprocess.Popen(
         tor_cmd,
         stdout=subprocess.PIPE,
