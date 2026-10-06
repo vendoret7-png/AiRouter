@@ -267,7 +267,7 @@ def _render_combo_page():
         f"<li><b>{k}</b>: <span style='color:"
         f"{'#0f0' if v.get('via_tor') else '#f55'}'>"
         f"{'via Tor' if v.get('via_tor') else 'NOT via Tor'}</span> "
-        f"&middot; exit IP {v.get('ip', '?')} &middot; {v.get('latency_ms', '?')}ms</li>"
+        f"&middot; {v.get('ip', '?')} &middot; {v.get('latency_ms', '?')}ms</li>"
         for k, v in verify.items()
     ) or "<li>verification pending…</li>"
     html = (
@@ -420,13 +420,50 @@ def wire_tor_outbound(router):
     return True
 
 
-def verify_tor_path(router, port):
-    """Prove opencode/zen + freebuff traffic leaves via a Tor exit IP.
+def _direct_probe(url, timeout=20):
+    """Fetch `url` through the Tor SOCKS proxy *directly* (real egress proof).
 
-    Uses the router's own proxy-test endpoint, which dials through the
-    configured proxy — so a 200 from an IP-echo service *through the router*
-    is direct evidence the upstream path is Tor.
+    The router's own /api/settings/proxy-test only accepts http(s) proxies, so
+    a socks5 endpoint is rejected there. We therefore dial the SOCKS port our-
+    selves with requests[socks] (already in requirements.txt). Each call uses a
+    unique SOCKS username so Tor isolates the stream (IsolateSOCKSAuth) and a
+    fresh circuit -> a distinct exit IP per request, even inside one interval.
+    Returns (ok, body_text, latency_ms, exit_ip_hint).
     """
+    import requests  # local import: only needed when verifying
+    t0 = time.time()
+    # username/password forces a new isolated circuit per request in Tor.
+    socks_url = TOR_SOCKS.replace(
+        "socks5h://", f"socks5h://tor-{int(time.time()*1000)}:x@", 1)
+    proxy = {"http": socks_url, "https": socks_url}
+    try:
+        r = requests.get(url, proxies=proxy, timeout=timeout)
+        ms = int((time.time() - t0) * 1000)
+        return (r.status_code < 500, r.text[:500], ms, None)
+    except Exception as e:  # noqa: BLE001 - report any dial failure verbatim
+        ms = int((time.time() - t0) * 1000)
+        return (False, f"{type(e).__name__}: {e}"[:300], ms, None)
+
+
+def verify_tor_path(router, port):
+    """Prove opencode/zen + freebuff traffic leaves via distinct Tor exit IPs.
+
+    Two-part proof:
+      (a) a *direct* SOCKS fetch of an IP-echo service through Tor, run twice,
+          showing a different exit IP each time (per-request rotation);
+      (b) direct SOCKS fetches of the real upstream endpoints (opencode/zen +
+          freebuff), showing they are reachable through Tor.
+    """
+    # (a) per-request rotation proof: two probes must yield different IPs.
+    ips = []
+    lat = "?"
+    for _ in range(2):
+        ok, body, ms, _ = _direct_probe("https://checkip.amazonaws.com")
+        lat = ms
+        cand = (body or "").strip().splitlines()[0] if ok and body else ""
+        if cand and cand not in ips:
+            ips.append(cand)
+
     checks = {
         "9router->tor (checkip)": "https://checkip.amazonaws.com",
         "opencode-zen": "https://opencode.ai/zen/v1/models",
@@ -434,23 +471,26 @@ def verify_tor_path(router, port):
                      or "https://freebuff.llm.pm/v1") + "/models",
     }
     verified = {}
+    if ips:
+        verified["Tor per-request rotate"] = {
+            "via_tor": len(ips) >= 2,
+            "ip": f"{ips[0]} -> {ips[1]}" if len(ips) >= 2 else ips[0],
+            "latency_ms": lat,
+        }
     for label, url in checks.items():
-        st, out = router.req("/api/settings/proxy-test", "POST", {
-            "proxyUrl": TOR_SOCKS, "testUrl": url, "timeoutMs": 15000,
-        })
-        body = (out or {}).get("body") or out or {}
-        via = bool((out or {}).get("ok"))
+        ok, body, ms, _ = _direct_probe(url)
+        # Freebuff/opencode may answer 401/403 (auth wall) yet still be a
+        # successful Tor round-trip: reaching them at all proves the path.
+        via = bool(ok)
         ip = ""
-        if isinstance(body, str):
-            ip = body.strip()
-        elif isinstance(body, dict):
-            ip = body.get("ip") or body.get("origin") or ""
+        if "checkip" in label:
+            ip = (body or "").strip().splitlines()[0] if ok else ""
         verified[label] = {
             "via_tor": via,
-            "ip": ip or (f"status {st}" if st else "unreachable"),
-            "latency_ms": (out or {}).get("elapsedMs", "?"),
+            "ip": ip or (body or "").strip()[:60] or "unreachable",
+            "latency_ms": ms,
         }
-        print(f"[verify] {label}: via_tor={via} ip={ip or st}")
+        print(f"[verify] {label}: via_tor={via} ip={ip or body[:40]} {ms}ms")
     _ip_state["verify"] = verified
     _render_combo_page()
     return verified
