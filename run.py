@@ -213,6 +213,74 @@ def note_ip(ip):
     _render_ip_page()
 
 
+# --- freebuff provider import ----------------------------------------------
+# Idempotent: re-running creates nothing twice — node reused by baseUrl,
+# connection reused by node id. From 127.0.0.1 the custom-server stamps the
+# peer-token header itself, so /api/* calls bypass login.
+def import_freebuff(port):
+    if os.environ.get("FREEBUFF_ENABLED", "1") not in ("1", "true", "yes"):
+        print("[freebuff] disabled (FREEBUFF_ENABLED!=1)")
+        return
+    base = (os.environ.get("FREEBUFF_BASE_URL") or "https://freebuff.llm.pm/v1").strip().rstrip("/")
+    key = os.environ.get("FREEBUFF_API_KEY", "").strip()
+    name = os.environ.get("FREEBUFF_NAME", "Freebuff").strip()
+    prefix = os.environ.get("FREEBUFF_PREFIX", "freebuff").strip()
+    url = f"http://127.0.0.1:{port}"
+
+    def req(path, method="GET", payload=None):
+        data = json.dumps(payload).encode() if payload is not None else None
+        r = urllib.request.Request(url + path, data=data, method=method,
+                                   headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(r, timeout=20) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8", "replace") or "{}")
+        except Exception as e:
+            return None, {"error": str(e)}
+
+    # 1) provider node (openai-compatible). Reuse by baseUrl.
+    node_id = None
+    st, nodes = req("/api/provider-nodes")
+    for n in (nodes or {}).get("nodes", []) or []:
+        if n.get("type") == "openai-compatible" and (n.get("baseUrl") or "").rstrip("/") == base:
+            node_id = n.get("id")
+            break
+    if not node_id:
+        st, out = req("/api/provider-nodes", "POST", {
+            "name": name, "prefix": prefix, "type": "openai-compatible",
+            "apiType": "chat", "baseUrl": base,
+        })
+        node_id = (out or {}).get("node", {}).get("id")
+        print(f"[freebuff] node create: {st} id={node_id} err={(out or {}).get('error')}")
+    else:
+        print(f"[freebuff] node reused: {node_id}")
+    if not node_id:
+        return
+
+    # 2) connection under that node. Reuse by provider id.
+    st, conns = req("/api/providers")
+    existing = None
+    for c in (conns or {}).get("connections", []) or []:
+        if c.get("provider") == node_id:
+            existing = c
+            break
+    if not existing and key:
+        st, out = req("/api/providers", "POST", {
+            "provider": node_id, "apiKey": key, "name": name,
+            "allowOverwrite": True,
+        })
+        print(f"[freebuff] connection create: {st} err={(out or {}).get('error')}")
+        existing = (out or {}).get("connection")
+    elif not key and not existing:
+        print("[freebuff] node ready; set FREEBUFF_API_KEY to attach a connection")
+    else:
+        print(f"[freebuff] connection reused: {existing.get('id')}")
+
+    # 3) pull upstream models so they show up (GET import-fetches from baseUrl).
+    st, out = req(f"/api/providers/{node_id}/models")
+    models = out if isinstance(out, list) else out.get("models") or out.get("data") or []
+    print(f"[freebuff] models from upstream: {st} count={len(models) if isinstance(models, list) else 'n/a'}")
+
+
 def update_watcher(state):
     """Background thread: poll npm for a newer 9router and update in place.
 
@@ -296,6 +364,10 @@ def main():
         print(f"[router] waiting for port {router_port} ...")
         if wait_for_port(router_port, timeout=45):
             print(f"[router] up at http://0.0.0.0:{router_port}")
+            try:
+                import_freebuff(router_port)
+            except Exception as e:
+                print(f"[freebuff] import failed: {e}")
         else:
             print(f"[router] warning: port {router_port} not reachable yet; see router.log")
 
@@ -339,6 +411,10 @@ def main():
                     print(f"[router] warning: port {router_port} not back yet")
                 else:
                     print(f"[router] back up at http://0.0.0.0:{router_port}")
+                    try:
+                        import_freebuff(router_port)
+                    except Exception as e:
+                        print(f"[freebuff] import failed: {e}")
 
             if update_state.get("action") == "update":
                 # Watcher installed a newer 9router — graceful reload so the
@@ -358,6 +434,10 @@ def main():
                     print(f"[update] warning: port {router_port} not back yet")
                 else:
                     print(f"[update] {PACKAGE_NAME} updated, back up")
+                    try:
+                        import_freebuff(router_port)
+                    except Exception as e:
+                        print(f"[freebuff] import failed: {e}")
                 CURRENT_VERSION = update_state.get("latest") or CURRENT_VERSION
                 update_state["action"] = ""
 

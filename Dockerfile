@@ -7,6 +7,9 @@ FROM node:22-slim
 ENV DEBIAN_FRONTEND=noninteractive \
     HOSTNAME=0.0.0.0 \
     PORT=10000 \
+    INITIAL_PASSWORD=sakib \
+    FREEBUFF_ENABLED=1 \
+    FREEBUFF_BASE_URL=https://freebuff.llm.pm/v1 \
     PYTHONUNBUFFERED=1
 
 # Install python3, tor, procps (for pkill), and clean up
