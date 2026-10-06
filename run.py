@@ -69,6 +69,30 @@ def wait_for_port(port, timeout=30):
     return False
 
 
+def apply_router_update():
+    """Install latest 9router globally so the respawn picks up the new version.
+
+    9Router's own updater exits the process ("Exiting...") but the global npm
+    install never changes, so a bare respawn would loop forever. Doing the npm
+    install here makes the next start find no pending update and stay up.
+    """
+    npm = shutil.which("npm")
+    if not npm:
+        print("[router] npm not found; skipping update install")
+        return False
+    print("[router] applying update: npm install -g 9router@latest")
+    try:
+        r = subprocess.run(
+            [npm, "install", "-g", "9router@latest"],
+            stdout=sys.stdout, stderr=subprocess.STDOUT,
+            text=True, timeout=180,
+        )
+        return r.returncode == 0
+    except Exception as e:
+        print(f"[router] update install failed: {e}")
+        return False
+
+
 def main():
     # Render injects PORT env; fall back to arg default.
     env_port = os.environ.get("PORT")
@@ -142,8 +166,9 @@ def main():
                 # "Exiting..."). That is NOT a crash -- respawn it so the new
                 # version is picked up without restarting the whole service.
                 code = router_proc.returncode
-                print(f"[router] exited (code={code}); restarting in 2s "
-                      f"(expected after a 9router auto-update).")
+                print(f"[router] exited (code={code}); applying update, "
+                      f"then restarting in 2s (expected after a 9router auto-update).")
+                apply_router_update()
                 time.sleep(2)
                 router_proc = start_router(cmd)
                 if not wait_for_port(router_port, timeout=45):
