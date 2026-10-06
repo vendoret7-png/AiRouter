@@ -28,25 +28,28 @@ def find_9router(mode, port):
     if mode == "npm":
         npx = shutil.which("npx") or shutil.which("npm")
         router = shutil.which("9router")
+        # Docker overrides $HOSTNAME with the container ID, so never rely on
+        # env for binding — pass --host/--port explicitly.
+        flags = ["--host", "0.0.0.0", "--port", str(port),
+                 "--no-browser", "--skip-update"]
         if router:
-            return [router]  # 9router reads PORT env var
+            return [router] + flags
         if npx:
-            return [npx, "9router@latest"]  # also reads PORT env
+            return [npx, "9router@latest"] + flags
         return None
     return None
 
 
-def start_router(cmd, log_path):
-    """Start router in background. PORT env is inherited from this process."""
+def start_router(cmd):
+    """Start router in background, inheriting stdout so 9Router logs reach Render."""
     print(f"[router] starting: {' '.join(cmd)}")
-    with open(log_path, "w", encoding="utf-8") as f:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            text=True,
-            shell=False,
-        )
+    proc = subprocess.Popen(
+        cmd,
+        stdout=None,
+        stderr=subprocess.STDOUT,
+        text=True,
+        shell=False,
+    )
     return proc
 
 
@@ -90,16 +93,13 @@ def main():
     # Export PORT so 9Router subprocess sees it (needed when we launch via npx/9router).
     os.environ["PORT"] = str(router_port)
 
-    log_dir = Path(__file__).parent / ".ai-router-logs"
-    log_dir.mkdir(exist_ok=True)
-
     router_proc = None
     if args.router_mode != "none":
         cmd = find_9router(args.router_mode, router_port)
         if not cmd:
             print(f"[!] Cannot find 9router / npx / npm for router mode {args.router_mode}.")
             sys.exit(1)
-        router_proc = start_router(cmd, log_dir / "router.log")
+        router_proc = start_router(cmd)
         print(f"[router] waiting for port {router_port} ...")
         if wait_for_port(router_port, timeout=45):
             print(f"[router] up at http://0.0.0.0:{router_port}")
