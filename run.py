@@ -10,13 +10,16 @@ it for --router-port wait check.
 """
 
 import argparse
+import json
 import os
 import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
 from pathlib import Path
 
 
@@ -30,10 +33,11 @@ def find_9router(mode, port):
         router = shutil.which("9router")
         # Docker overrides $HOSTNAME with the container ID, so never rely on
         # env for binding — pass --host/--port explicitly.
-        # NOTE: do NOT pass --skip-update — we WANT 9Router's built-in
-        # auto-update so new versions apply without a manual restart.
+        # --skip-update is REQUIRED: without it, in a non-TTY container the
+        # launcher menu resolves to "exit" and 9router dies with "Exiting...".
+        # run.py owns the update check below instead.
         flags = ["--host", "0.0.0.0", "--port", str(port),
-                 "--no-browser"]
+                 "--no-browser", "--skip-update"]
         if router:
             return [router] + flags
         if npx:
@@ -69,28 +73,109 @@ def wait_for_port(port, timeout=30):
     return False
 
 
-def apply_router_update():
-    """Install latest 9router globally so the respawn picks up the new version.
+PACKAGE_NAME = "9router"
+PACKAGE_MANAGER = "npm"
+CURRENT_VERSION = "0.0.0"
+UPDATE_CHECK_INTERVAL = int(os.environ.get("ROUTER_UPDATE_INTERVAL", "1800"))
 
-    9Router's own updater exits the process ("Exiting...") but the global npm
-    install never changes, so a bare respawn would loop forever. Doing the npm
-    install here makes the next start find no pending update and stay up.
-    """
+
+def _installed_version():
+    """Return the globally installed 9router version, or None if unknown."""
     npm = shutil.which("npm")
     if not npm:
-        print("[router] npm not found; skipping update install")
-        return False
-    print("[router] applying update: npm install -g 9router@latest")
+        return None
     try:
         r = subprocess.run(
-            [npm, "install", "-g", "9router@latest"],
+            [npm, "list", "-g", PACKAGE_NAME, "--depth=0", "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=60,
+        )
+        data = json.loads(r.stdout or "{}")
+        dep = (data.get("dependencies") or {}).get(PACKAGE_NAME) or {}
+        return dep.get("version")
+    except Exception:
+        return None
+
+
+def _latest_version(timeout=8):
+    """Return latest version published on the npm registry, or None."""
+    url = f"https://registry.npmjs.org/{PACKAGE_NAME}/latest"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        return data.get("version")
+    except Exception as e:
+        print(f"[update] registry check failed: {e}")
+        return None
+
+
+def _is_newer(latest, current):
+    """True if latest > current using dotted numeric comparison."""
+    if not latest or not current:
+        return False
+    def parts(v):
+        out = []
+        for chunk in str(v).split("."):
+            num = ""
+            for ch in chunk:
+                if ch.isdigit():
+                    num += ch
+                else:
+                    break
+            out.append(int(num) if num else 0)
+        return out
+    a, b = parts(latest), parts(current)
+    size = max(len(a), len(b))
+    a += [0] * (size - len(a))
+    b += [0] * (size - len(b))
+    return a > b
+
+
+def _npm_install_latest():
+    """Install the newest 9router globally. Returns True on success."""
+    npm = shutil.which("npm")
+    if not npm:
+        print("[update] npm not found; skipping install")
+        return False
+    print(f"[update] installing {PACKAGE_MANAGER} -g {PACKAGE_NAME}@latest ...")
+    try:
+        r = subprocess.run(
+            [PACKAGE_MANAGER, "install", "-g", f"{PACKAGE_NAME}@latest", "--prefer-online"],
             stdout=sys.stdout, stderr=subprocess.STDOUT,
-            text=True, timeout=180,
+            text=True, timeout=300,
         )
         return r.returncode == 0
     except Exception as e:
-        print(f"[router] update install failed: {e}")
+        print(f"[update] install failed: {e}")
         return False
+
+
+def apply_router_update():
+    """Install the latest 9router globally (used after the router terminates)."""
+    return _npm_install_latest()
+
+
+def update_watcher(state):
+    """Background thread: poll npm for a newer 9router and update in place.
+
+    Runs independently of the router process so a new release can be installed
+    without stopping the service. `state` is a shared dict with keys:
+      - "action": "" | "update"  (set when a fresh version was installed)
+      - "stop":   bool           (set by main to end the thread)
+    """
+    while not state.get("stop"):
+        if state.get("action"):
+            # An update is pending a restart; wait for the main loop to handle it.
+            time.sleep(5)
+            continue
+        latest = _latest_version()
+        if latest and _is_newer(latest, CURRENT_VERSION):
+            print(f"[update] new {PACKAGE_NAME} available: {CURRENT_VERSION} -> {latest}")
+            if _npm_install_latest():
+                state["action"] = "update"
+                state["latest"] = latest
+                continue
+        time.sleep(UPDATE_CHECK_INTERVAL)
 
 
 def main():
@@ -123,6 +208,18 @@ def main():
 
     router_proc = None
     cmd = None
+
+    # --- auto-update watcher (runs in background, no downtime) -------------
+    global CURRENT_VERSION
+    if args.router_mode == "npm":
+        CURRENT_VERSION = _installed_version() or "0.0.0"
+    update_state = {"action": "", "stop": False, "latest": CURRENT_VERSION}
+    threading.Thread(
+        target=update_watcher, args=(update_state,), daemon=True
+    ).start()
+    print(f"[update] watcher started (every {UPDATE_CHECK_INTERVAL}s), "
+          f"installed {PACKAGE_NAME}@{CURRENT_VERSION}")
+
     if args.router_mode != "none":
         cmd = find_9router(args.router_mode, router_port)
         if not cmd:
@@ -175,6 +272,28 @@ def main():
                     print(f"[router] warning: port {router_port} not back yet")
                 else:
                     print(f"[router] back up at http://0.0.0.0:{router_port}")
+
+            if update_state.get("action") == "update":
+                # Watcher installed a newer 9router — graceful reload so the
+                # service never goes down (wait_for_port gates before signaling
+                # the new process; the old one is already gone).
+                print(f"[update] restarting router to apply {update_state.get('latest')}")
+                old = router_proc
+                if old and old.poll() is None:
+                    old.terminate()
+                    try:
+                        old.wait(timeout=10)
+                    except Exception:
+                        old.kill()
+                time.sleep(2)
+                router_proc = start_router(cmd)
+                if not wait_for_port(router_port, timeout=45):
+                    print(f"[update] warning: port {router_port} not back yet")
+                else:
+                    print(f"[update] {PACKAGE_NAME} updated, back up")
+                CURRENT_VERSION = update_state.get("latest") or CURRENT_VERSION
+                update_state["action"] = ""
+
             if tor_proc.poll() is not None:
                 print("[tor] auto IP changer exited.")
                 break
@@ -186,6 +305,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[*] shutting down...")
     finally:
+        update_state["stop"] = True
         if tor_proc and tor_proc.poll() is None:
             tor_proc.terminate()
         if router_proc and router_proc.poll() is None:
